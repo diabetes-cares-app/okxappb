@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+yt-dlp
+curl-cffi
+beautifulsoup4
+httpx
+cachetools
+slowapi
