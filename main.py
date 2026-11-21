@@ -1,5 +1,6 @@
 import os
 import re
+import json
 from urllib.parse import urlparse, quote
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -16,8 +17,6 @@ from curl_cffi import requests as cffi_requests
 from bs4 import BeautifulSoup
 import httpx
 
-# Optional residential proxy URL from Railway environment variables
-# Format example: http://provider.com
 PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
 
 
@@ -40,7 +39,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Cache up to 500 URLs for 30 minutes (1800s)
 response_cache = TTLCache(maxsize=500, ttl=1800)
 
 ALLOWED_EXACT_DOMAINS = (
@@ -81,7 +79,6 @@ def is_allowed_cdn(url: str) -> bool:
 
 
 def resolve_redirects(url: str, proxy: str | None = None) -> str:
-    """Follow short links like ://facebook.com... or fb.watch/... to their final URL."""
     try:
         proxies = {"http": proxy, "https": proxy} if proxy else None
         resp = cffi_requests.get(
@@ -146,14 +143,99 @@ def extract_with_ytdlp(url: str, proxy: str | None = None) -> dict:
         }
 
 
-def extract_og_and_carousel_fallback(url: str, proxy: str | None = None) -> dict:
+def extract_instagram_embed(url: str, proxy: str | None = None) -> dict:
+    """Extracts all carousel slides (images & videos) from Instagram's public embed endpoint."""
+    match = re.search(r"instagram\.com/(?:p|reel|tv)/([A-Za-z0-9_-]+)", url)
+    if not match:
+        raise ValueError("Not an Instagram post URL")
+
+    shortcode = match.group(1)
+    embed_url = f"https://instagram.com{shortcode}/embed/captioned/"
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+
+    resp = cffi_requests.get(embed_url, impersonate="chrome", proxies=proxies, timeout=12)
+    if resp.status_code != 200:
+        raise ValueError(f"Embed HTTP {resp.status_code}")
+
+    html = resp.text
+    items = []
+
+    # 1. Parse embedded JSON object containing edge_sidecar_to_children
+    json_match = re.search(r'"gql_data"\s*:\s*(\{.*?\})\s*,\s*"', html)
+    if not json_match:
+        json_match = re.search(r'window\.__additionalDataLoaded\([^,]+,\s*(\{.*?\})\);', html)
+
+    if json_match:
+        try:
+            data = json.loads(json_match.group(1))
+            media = (
+                data.get("shortcode_media")
+                or data.get("graphql", {}).get("shortcode_media")
+                or {}
+            )
+            edges = (
+                media.get("edge_sidecar_to_children", {}).get("edges", [])
+            )
+            nodes = [e["node"] for e in edges if "node" in e] or ([media] if media else [])
+
+            for idx, node in enumerate(nodes, start=1):
+                is_video = node.get("is_video", False)
+                media_url = node.get("video_url") if is_video else node.get("display_url")
+                thumb = node.get("display_url")
+                if media_url and is_allowed_cdn(media_url):
+                    items.append(
+                        {
+                            "index": idx,
+                            "media_type": "video" if is_video else "image",
+                            "media_url": media_url,
+                            "thumbnail": thumb,
+                            "ext": "mp4" if is_video else "jpg",
+                        }
+                    )
+        except Exception:
+            pass
+
+    # 2. Fallback regex across escaped/unescaped display_url & video_url in embed HTML
+    if not items:
+        soup = BeautifulSoup(html, "html.parser")
+        seen = set()
+        for img in soup.select("img.EmbeddedMediaImage, img[src*='cdninstagram.com'], img[src*='fbcdn.net']"):
+            src = img.get("src", "")
+            # Filter out tiny profile avatars (usually 150x150 or s150x150)
+            if src and is_allowed_cdn(src) and "s150x150" not in src and src not in seen:
+                seen.add(src)
+                items.append(
+                    {
+                        "index": len(items) + 1,
+                        "media_type": "image",
+                        "media_url": src,
+                        "thumbnail": src,
+                        "ext": "jpg",
+                    }
+                )
+
+    if not items:
+        raise ValueError("No carousel items found in embed")
+
+    soup = BeautifulSoup(html, "html.parser")
+    caption_el = soup.select_one(".Caption")
+    user_el = soup.select_one(".UsernameText")
+
+    return {
+        "title": "Instagram Post",
+        "description": caption_el.get_text(" ", strip=True) if caption_el else "",
+        "uploader": user_el.get_text(strip=True) if user_el else "Instagram",
+        "items": items,
+    }
+
+
+def extract_og_fallback(url: str, proxy: str | None = None) -> dict:
     proxies = {"http": proxy, "https": proxy} if proxy else None
     resp = cffi_requests.get(url, impersonate="chrome", proxies=proxies, timeout=12)
     if resp.status_code != 200:
         raise ValueError(f"HTTP {resp.status_code}")
 
-    html = resp.text
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(resp.text, "html.parser")
 
     def get_meta(prop):
         tag = soup.find("meta", property=prop)
@@ -163,31 +245,20 @@ def extract_og_and_carousel_fallback(url: str, proxy: str | None = None) -> dict
     description = get_meta("og:description")
     og_image = get_meta("og:image")
 
-    raw_urls = re.findall(r'"display_url"\s*:\s*"(https:[^"]+)"', html)
-    clean_urls = []
-    seen = set()
-    for u in raw_urls:
-        decoded = u.replace("\\u0026", "&").replace("\\/", "/")
-        if decoded not in seen and is_allowed_cdn(decoded):
-            seen.add(decoded)
-            clean_urls.append(decoded)
-
-    if not clean_urls and og_image:
-        clean_urls = [og_image]
-
-    if not clean_urls and not any([title, description]):
+    if not any([title, og_image, description]):
         raise ValueError("Login wall hit or no public metadata found")
 
-    items = [
-        {
-            "index": idx,
-            "media_type": "image",
-            "media_url": img_url,
-            "thumbnail": img_url,
-            "ext": "jpg",
-        }
-        for idx, img_url in enumerate(clean_urls, start=1)
-    ]
+    items = []
+    if og_image:
+        items.append(
+            {
+                "index": 1,
+                "media_type": "image",
+                "media_url": og_image,
+                "thumbnail": og_image,
+                "ext": "jpg",
+            }
+        )
 
     return {
         "title": title or "Public Post",
@@ -198,10 +269,21 @@ def extract_og_and_carousel_fallback(url: str, proxy: str | None = None) -> dict
 
 
 def attempt_extraction(url: str, proxy: str | None = None) -> dict:
+    # 1. Try Instagram embed endpoint first for Instagram /p/ posts (captures multi-slide carousels)
+    if "instagram.com" in urlparse(url).netloc.lower():
+        try:
+            return extract_instagram_embed(url, proxy=proxy)
+        except Exception:
+            pass
+
+    # 2. Try yt-dlp (great for Reels, Facebook videos, and single video posts)
     try:
         return extract_with_ytdlp(url, proxy=proxy)
     except Exception:
-        return extract_og_and_carousel_fallback(url, proxy=proxy)
+        pass
+
+    # 3. Fallback to OpenGraph metadata
+    return extract_og_fallback(url, proxy=proxy)
 
 
 @app.post("/fetch")
@@ -221,80 +303,6 @@ def fetch_public_content(request: Request, payload: UrlRequest):
     result = None
     last_error = None
 
-    # 1. Try direct server request first (resolving /share/ links)
     try:
         target_url = resolve_redirects(raw_url, proxy=None)
         result = attempt_extraction(target_url, proxy=None)
-    except Exception as e:
-        last_error = e
-
-    # 2. Fallback to PROXY_URL if configured and direct attempt failed
-    if not result and PROXY_URL:
-        try:
-            target_url = resolve_redirects(raw_url, proxy=PROXY_URL)
-            result = attempt_extraction(target_url, proxy=PROXY_URL)
-        except Exception as e:
-            last_error = e
-
-    if not result:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Could not extract public data without login. ({last_error})",
-        )
-
-    response_cache[cache_key] = result
-    return {**result, "cached": False}
-
-
-@app.get("/proxy")
-@limiter.limit("60/minute")
-async def proxy_media(
-    request: Request,
-    media_url: str = Query(...),
-    download: bool = Query(False),
-    filename: str = Query("media.mp4"),
-):
-    if not is_allowed_cdn(media_url):
-        raise HTTPException(status_code=400, detail="Invalid media host.")
-
-    client = httpx.AsyncClient(follow_redirects=True, timeout=30.0)
-    req = client.build_request("GET", media_url, headers={"User-Agent": "Mozilla/5.0"})
-    resp = await client.send(req, stream=True)
-
-    if resp.status_code >= 400:
-        await resp.aclose()
-        await client.aclose()
-        raise HTTPException(status_code=502, detail="Failed to fetch media from CDN.")
-
-    headers = {}
-    if download:
-        safe_name = quote(filename)
-        headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{safe_name}"
-
-    async def stream_generator():
-        try:
-            async for chunk in resp.aiter_bytes(chunk_size=65536):
-                yield chunk
-        finally:
-            await resp.aclose()
-            await client.aclose()
-
-    return StreamingResponse(
-        stream_generator(),
-        media_type=resp.headers.get("content-type", "application/octet-stream"),
-        headers=headers,
-    )
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok", "proxy_configured": bool(PROXY_URL)}
-
-
-os.makedirs("static", exist_ok=True)
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
-
-@app.get("/")
-def serve_frontend():
-    return FileResponse("static/index.html")
