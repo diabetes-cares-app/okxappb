@@ -1,21 +1,33 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, HttpUrl
 from urllib.parse import urlparse, quote
+from cachetools import TTLCache
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 import yt_dlp
 from curl_cffi import requests as cffi_requests
 from bs4 import BeautifulSoup
 import httpx
+import re
 
+# Rate limiter: keyed by client IP
+limiter = Limiter(key_func=get_remote_address)
 app = FastAPI()
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Lock this down to your domain in production
+    allow_origins=["*"],  # Replace with your frontend domain in production
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Cache up to 500 URLs for 30 minutes (1800s) — Meta CDN tokens expire after a few hours
+response_cache = TTLCache(maxsize=500, ttl=1800)
 
 ALLOWED_SOURCE_DOMAINS = (
     "instagram.com", "://instagram.com",
@@ -28,6 +40,11 @@ ALLOWED_CDN_SUFFIXES = (
 
 class UrlRequest(BaseModel):
     url: HttpUrl
+
+def normalize_url(url: str) -> str:
+    parsed = urlparse(url)
+    # Strip tracking query params (e.g. ?igsh=...) so cache hits work reliably
+    return f"{parsed.scheme}://{parsed.netloc.lower()}{parsed.path.rstrip('/')}"
 
 def is_supported_domain(url: str) -> bool:
     return urlparse(url).netloc.lower() in ALLOWED_SOURCE_DOMAINS
@@ -45,69 +62,124 @@ def extract_with_ytdlp(url: str) -> dict:
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
+        items = []
+
+        # yt-dlp returns 'entries' for carousels / multi-item posts
+        entries = info.get("entries") or [info]
+        for idx, entry in enumerate(entries, start=1):
+            if not entry:
+                continue
+            media_url = entry.get("url")
+            thumb = entry.get("thumbnail")
+            ext = entry.get("ext") or "mp4"
+            is_video = ext in ("mp4", "webm", "mov") or bool(entry.get("vcodec") and entry.get("vcodec") != "none")
+
+            if media_url:
+                items.append({
+                    "index": idx,
+                    "media_type": "video" if is_video else "image",
+                    "media_url": media_url,
+                    "thumbnail": thumb,
+                    "ext": ext if is_video else "jpg",
+                })
+
+        if not items:
+            raise ValueError("No media items extracted")
+
         return {
-            "type": "video",
-            "title": info.get("title") or "Social Media Video",
+            "title": info.get("title") or "Social Media Post",
             "description": info.get("description") or "",
             "uploader": info.get("uploader") or info.get("channel") or "Public Account",
-            "thumbnail": info.get("thumbnail"),
-            "media_url": info.get("url"),
-            "ext": info.get("ext") or "mp4",
+            "items": items,
         }
 
-def extract_og_metadata(url: str) -> dict:
+def extract_og_and_carousel_fallback(url: str) -> dict:
     resp = cffi_requests.get(url, impersonate="chrome", timeout=10)
     if resp.status_code != 200:
         raise ValueError(f"HTTP {resp.status_code}")
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    html = resp.text
+    soup = BeautifulSoup(html, "html.parser")
+
     def get_meta(prop):
         tag = soup.find("meta", property=prop)
         return tag["content"] if tag and tag.get("content") else None
 
     title = get_meta("og:title")
-    image = get_meta("og:image")
     description = get_meta("og:description")
+    og_image = get_meta("og:image")
 
-    if not any():
+    # Attempt to find display_url entries embedded in public Instagram JSON blobs
+    raw_urls = re.findall(r'"display_url"\s*:\s*"(https:[^"]+)"', html)
+    clean_urls = []
+    seen = set()
+    for u in raw_urls:
+        decoded = u.replace("\\u0026", "&").replace("\\/", "/")
+        if decoded not in seen and is_allowed_cdn(decoded):
+            seen.add(decoded)
+            clean_urls.append(decoded)
+
+    if not clean_urls and og_image:
+        clean_urls = [og_image]
+
+    if not clean_urls and not any([title, description]):
         raise ValueError("Login wall hit or no public metadata found")
 
+    items = [
+        {
+            "index": idx,
+            "media_type": "image",
+            "media_url": img_url,
+            "thumbnail": img_url,
+            "ext": "jpg",
+        }
+        for idx, img_url in enumerate(clean_urls, start=1)
+    ]
+
     return {
-        "type": "image_or_post",
         "title": title or "Public Post",
         "description": description or "",
         "uploader": urlparse(url).netloc,
-        "thumbnail": image,
-        "media_url": image,
-        "ext": "jpg",
+        "items": items,
     }
 
 @app.post("/fetch")
-def fetch_public_content(payload: UrlRequest):
-    url = str(payload.url)
-    if not is_supported_domain(url):
+@limiter.limit("15/minute")  # Max 15 lookups per minute per IP
+def fetch_public_content(request: Request, payload: UrlRequest):
+    raw_url = str(payload.url)
+    if not is_supported_domain(raw_url):
         raise HTTPException(status_code=400, detail="Only Instagram and Facebook URLs are supported.")
 
+    cache_key = normalize_url(raw_url)
+    if cache_key in response_cache:
+        return {**response_cache[cache_key], "cached": True}
+
+    result = None
     try:
-        return extract_with_ytdlp(url)
+        result = extract_with_ytdlp(raw_url)
     except Exception:
         pass
 
-    try:
-        return extract_og_metadata(url)
-    except Exception as e:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Could not extract public data without login. ({e})"
-        )
+    if not result:
+        try:
+            result = extract_og_and_carousel_fallback(raw_url)
+        except Exception as e:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Could not extract public data without login. ({e})"
+            )
+
+    response_cache[cache_key] = result
+    return {**result, "cached": False}
 
 @app.get("/proxy")
+@limiter.limit("60/minute")  # Higher limit since carousels load multiple slides at once
 async def proxy_media(
+    request: Request,
     media_url: str = Query(...),
     download: bool = Query(False),
     filename: str = Query("media.mp4")
 ):
-    # Prevent open-proxy abuse by restricting to Meta CDNs
     if not is_allowed_cdn(media_url):
         raise HTTPException(status_code=400, detail="Invalid media host.")
 
