@@ -43,12 +43,12 @@ app.add_middleware(
 # Cache up to 500 URLs for 30 minutes (1800s)
 response_cache = TTLCache(maxsize=500, ttl=1800)
 
-ALLOWED_SOURCE_DOMAINS = (
+ALLOWED_EXACT_DOMAINS = (
     "instagram.com",
-    "://instagram.com",
+    "instagr.am",
     "facebook.com",
-    "://facebook.com",
     "fb.watch",
+    "fb.com",
 )
 
 ALLOWED_CDN_SUFFIXES = (
@@ -63,17 +63,40 @@ class UrlRequest(BaseModel):
 
 
 def normalize_url(url: str) -> str:
-    parsed = urlparse(url)
+    parsed = urlparse(url.strip())
     return f"{parsed.scheme}://{parsed.netloc.lower()}{parsed.path.rstrip('/')}"
 
 
 def is_supported_domain(url: str) -> bool:
-    return urlparse(url).netloc.lower() in ALLOWED_SOURCE_DOMAINS
+    host = urlparse(url.strip()).netloc.lower().split(":")[0]
+    return any(
+        host == domain or host.endswith(f".{domain}")
+        for domain in ALLOWED_EXACT_DOMAINS
+    )
 
 
 def is_allowed_cdn(url: str) -> bool:
-    host = urlparse(url).netloc.lower()
+    host = urlparse(url).netloc.lower().split(":")[0]
     return any(host.endswith(suffix) for suffix in ALLOWED_CDN_SUFFIXES)
+
+
+def resolve_redirects(url: str, proxy: str | None = None) -> str:
+    """Follow short links like ://facebook.com... or fb.watch/... to their final URL."""
+    try:
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        resp = cffi_requests.get(
+            url,
+            impersonate="chrome",
+            proxies=proxies,
+            allow_redirects=True,
+            timeout=10,
+        )
+        final_url = str(resp.url)
+        if is_supported_domain(final_url) and "/login" not in final_url:
+            return final_url
+    except Exception:
+        pass
+    return url
 
 
 def extract_with_ytdlp(url: str, proxy: str | None = None) -> dict:
@@ -184,10 +207,11 @@ def attempt_extraction(url: str, proxy: str | None = None) -> dict:
 @app.post("/fetch")
 @limiter.limit("15/minute")
 def fetch_public_content(request: Request, payload: UrlRequest):
-    raw_url = str(payload.url)
+    raw_url = str(payload.url).strip()
     if not is_supported_domain(raw_url):
         raise HTTPException(
-            status_code=400, detail="Only Instagram and Facebook URLs are supported."
+            status_code=400,
+            detail=f"Only Instagram and Facebook URLs are supported. (Got: {urlparse(raw_url).netloc})",
         )
 
     cache_key = normalize_url(raw_url)
@@ -197,16 +221,18 @@ def fetch_public_content(request: Request, payload: UrlRequest):
     result = None
     last_error = None
 
-    # 1. Try direct server request first (saves proxy bandwidth)
+    # 1. Try direct server request first (resolving /share/ links)
     try:
-        result = attempt_extraction(raw_url, proxy=None)
+        target_url = resolve_redirects(raw_url, proxy=None)
+        result = attempt_extraction(target_url, proxy=None)
     except Exception as e:
         last_error = e
 
     # 2. Fallback to PROXY_URL if configured and direct attempt failed
     if not result and PROXY_URL:
         try:
-            result = attempt_extraction(raw_url, proxy=PROXY_URL)
+            target_url = resolve_redirects(raw_url, proxy=PROXY_URL)
+            result = attempt_extraction(target_url, proxy=PROXY_URL)
         except Exception as e:
             last_error = e
 
