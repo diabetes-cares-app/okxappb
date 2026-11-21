@@ -1,8 +1,12 @@
+import os
+import re
+from urllib.parse import urlparse, quote
+
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl
-from urllib.parse import urlparse, quote
 from cachetools import TTLCache
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -11,60 +15,81 @@ import yt_dlp
 from curl_cffi import requests as cffi_requests
 from bs4 import BeautifulSoup
 import httpx
-import re
 
-# Rate limiter: keyed by client IP
-limiter = Limiter(key_func=get_remote_address)
+# Optional residential proxy URL from Railway environment variables
+# Format example: http://provider.com
+PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
+
+
+def get_real_ip(request: Request) -> str:
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return get_remote_address(request)
+
+
+limiter = Limiter(key_func=get_real_ip)
 app = FastAPI()
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Replace with your frontend domain in production
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Cache up to 500 URLs for 30 minutes (1800s) — Meta CDN tokens expire after a few hours
+# Cache up to 500 URLs for 30 minutes (1800s)
 response_cache = TTLCache(maxsize=500, ttl=1800)
 
 ALLOWED_SOURCE_DOMAINS = (
-    "instagram.com", "://instagram.com",
-    "facebook.com", "://facebook.com", "fb.watch"
+    "instagram.com",
+    "://instagram.com",
+    "facebook.com",
+    "://facebook.com",
+    "fb.watch",
 )
 
 ALLOWED_CDN_SUFFIXES = (
-    ".cdninstagram.com", ".fbcdn.net", ".fbsbx.com"
+    ".cdninstagram.com",
+    ".fbcdn.net",
+    ".fbsbx.com",
 )
+
 
 class UrlRequest(BaseModel):
     url: HttpUrl
 
+
 def normalize_url(url: str) -> str:
     parsed = urlparse(url)
-    # Strip tracking query params (e.g. ?igsh=...) so cache hits work reliably
     return f"{parsed.scheme}://{parsed.netloc.lower()}{parsed.path.rstrip('/')}"
+
 
 def is_supported_domain(url: str) -> bool:
     return urlparse(url).netloc.lower() in ALLOWED_SOURCE_DOMAINS
+
 
 def is_allowed_cdn(url: str) -> bool:
     host = urlparse(url).netloc.lower()
     return any(host.endswith(suffix) for suffix in ALLOWED_CDN_SUFFIXES)
 
-def extract_with_ytdlp(url: str) -> dict:
+
+def extract_with_ytdlp(url: str, proxy: str | None = None) -> dict:
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "format": "best[ext=mp4]/best",
     }
+    if proxy:
+        ydl_opts["proxy"] = proxy
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
         items = []
 
-        # yt-dlp returns 'entries' for carousels / multi-item posts
         entries = info.get("entries") or [info]
         for idx, entry in enumerate(entries, start=1):
             if not entry:
@@ -72,16 +97,20 @@ def extract_with_ytdlp(url: str) -> dict:
             media_url = entry.get("url")
             thumb = entry.get("thumbnail")
             ext = entry.get("ext") or "mp4"
-            is_video = ext in ("mp4", "webm", "mov") or bool(entry.get("vcodec") and entry.get("vcodec") != "none")
+            is_video = ext in ("mp4", "webm", "mov") or bool(
+                entry.get("vcodec") and entry.get("vcodec") != "none"
+            )
 
             if media_url:
-                items.append({
-                    "index": idx,
-                    "media_type": "video" if is_video else "image",
-                    "media_url": media_url,
-                    "thumbnail": thumb,
-                    "ext": ext if is_video else "jpg",
-                })
+                items.append(
+                    {
+                        "index": idx,
+                        "media_type": "video" if is_video else "image",
+                        "media_url": media_url,
+                        "thumbnail": thumb,
+                        "ext": ext if is_video else "jpg",
+                    }
+                )
 
         if not items:
             raise ValueError("No media items extracted")
@@ -93,8 +122,10 @@ def extract_with_ytdlp(url: str) -> dict:
             "items": items,
         }
 
-def extract_og_and_carousel_fallback(url: str) -> dict:
-    resp = cffi_requests.get(url, impersonate="chrome", timeout=10)
+
+def extract_og_and_carousel_fallback(url: str, proxy: str | None = None) -> dict:
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    resp = cffi_requests.get(url, impersonate="chrome", proxies=proxies, timeout=12)
     if resp.status_code != 200:
         raise ValueError(f"HTTP {resp.status_code}")
 
@@ -109,7 +140,6 @@ def extract_og_and_carousel_fallback(url: str) -> dict:
     description = get_meta("og:description")
     og_image = get_meta("og:image")
 
-    # Attempt to find display_url entries embedded in public Instagram JSON blobs
     raw_urls = re.findall(r'"display_url"\s*:\s*"(https:[^"]+)"', html)
     clean_urls = []
     seen = set()
@@ -143,42 +173,60 @@ def extract_og_and_carousel_fallback(url: str) -> dict:
         "items": items,
     }
 
+
+def attempt_extraction(url: str, proxy: str | None = None) -> dict:
+    try:
+        return extract_with_ytdlp(url, proxy=proxy)
+    except Exception:
+        return extract_og_and_carousel_fallback(url, proxy=proxy)
+
+
 @app.post("/fetch")
-@limiter.limit("15/minute")  # Max 15 lookups per minute per IP
+@limiter.limit("15/minute")
 def fetch_public_content(request: Request, payload: UrlRequest):
     raw_url = str(payload.url)
     if not is_supported_domain(raw_url):
-        raise HTTPException(status_code=400, detail="Only Instagram and Facebook URLs are supported.")
+        raise HTTPException(
+            status_code=400, detail="Only Instagram and Facebook URLs are supported."
+        )
 
     cache_key = normalize_url(raw_url)
     if cache_key in response_cache:
         return {**response_cache[cache_key], "cached": True}
 
     result = None
+    last_error = None
+
+    # 1. Try direct server request first (saves proxy bandwidth)
     try:
-        result = extract_with_ytdlp(raw_url)
-    except Exception:
-        pass
+        result = attempt_extraction(raw_url, proxy=None)
+    except Exception as e:
+        last_error = e
+
+    # 2. Fallback to PROXY_URL if configured and direct attempt failed
+    if not result and PROXY_URL:
+        try:
+            result = attempt_extraction(raw_url, proxy=PROXY_URL)
+        except Exception as e:
+            last_error = e
 
     if not result:
-        try:
-            result = extract_og_and_carousel_fallback(raw_url)
-        except Exception as e:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Could not extract public data without login. ({e})"
-            )
+        raise HTTPException(
+            status_code=422,
+            detail=f"Could not extract public data without login. ({last_error})",
+        )
 
     response_cache[cache_key] = result
     return {**result, "cached": False}
 
+
 @app.get("/proxy")
-@limiter.limit("60/minute")  # Higher limit since carousels load multiple slides at once
+@limiter.limit("60/minute")
 async def proxy_media(
     request: Request,
     media_url: str = Query(...),
     download: bool = Query(False),
-    filename: str = Query("media.mp4")
+    filename: str = Query("media.mp4"),
 ):
     if not is_allowed_cdn(media_url):
         raise HTTPException(status_code=400, detail="Invalid media host.")
@@ -210,3 +258,17 @@ async def proxy_media(
         media_type=resp.headers.get("content-type", "application/octet-stream"),
         headers=headers,
     )
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "proxy_configured": bool(PROXY_URL)}
+
+
+os.makedirs("static", exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+@app.get("/")
+def serve_frontend():
+    return FileResponse("static/index.html")
